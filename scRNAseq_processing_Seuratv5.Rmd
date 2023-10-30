@@ -1,0 +1,349 @@
+---
+title: "Analysis of scRNAseq data from testis from young adults (PMID:30315278, GSE112013)"
+author: "Hernan Lorenzi"
+date: "10/17/2023"
+output:
+  html_document:
+    df_print: paged
+---
+
+#### Original read-counts data was extracted from [GSE112013](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE112013)
+
+The data was generated as part of the manuscript [*The adult human testis transcriptional cell atlas*](https://pubmed.ncbi.nlm.nih.gov/30315278/)
+
+```{r}
+library(pacman)
+p_load(Seurat,tidyverse, cowplot)
+```
+
+#### 1. Prepare working directory ------------
+```{r}
+dir.create(path = "./Plots", showWarnings = F)
+```
+
+#### 2. Load raw data ------------
+```{r}
+cts.all <- read.delim(file = "./data/GSE112013_Combined_UMI_table.txt", header = T, row.names = 1)
+
+# replacing "_" by "-"for compatibility with Seurat
+rownames(cts.all) <- rownames(cts.all) %>% str_replace_all(pattern = "_", replacement = "-")
+```
+
+#### 3. Create metadata from cell names (FORMAT: Donor_number.barcode.replicate_number) ------------
+
+```{r}
+names <-  colnames(cts.all)
+
+metadata.all <- data.frame(donor_name = names %>% str_remove(pattern = ".[ACGT]+.[12]"),
+                       replicate  = as.character(names %>% str_remove(pattern = "Donor[123].[ACGT]+.")),
+                       barcode   = names %>% str_remove(pattern = "Donor[123].") %>%  
+                         str_remove(pattern = ".[12]"),
+                       replicate_name = names %>% 
+                         str_replace(pattern = ".[ACGT]+.", replacement = "-")
+                       )
+rownames(metadata.all) <- colnames(cts.all)
+```
+
+#### 4. Load Table S1 from original manuscript ------------
+
+```{r}
+paper.meta <- read.csv(file = "data/Table_S1.csv", header = T, row.names = 1)
+
+rownames(paper.meta) <- rownames(paper.meta) %>% str_replace_all(pattern = "-", replacement = ".")
+
+paper.meta
+```
+
+#### 5. Merge metadata with paper.meta ------------
+
+```{r}
+metadata.all <- cbind(metadata.all, paper.meta)
+
+```
+
+#### 6. Create Seuratv5 object ------------
+
+```{r}
+# Create Seurat object
+so.all <- CreateSeuratObject(counts = Matrix::Matrix(as.matrix(cts.all),sparse = T), meta.data = metadata.all)
+
+```
+
+#### 7. QC ------------
+
+```{r}
+# 1. QC -------
+
+# % MT reads
+so.all[["percent.mt"]] <- PercentageFeatureSet(so.all, pattern = "^MT-")
+
+vln.p <- VlnPlot(so.all, features = c("nFeature_RNA", 
+                                      "nCount_RNA", 
+                                      "percent.mt"), 
+                 ncol = 3) 
+
+scatter.p <- FeatureScatter(so.all, feature1 = "nCount_RNA", 
+                            feature2 = "nFeature_RNA") +
+                            geom_smooth(method = 'lm') 
+
+ggsave2(filename = "QC_vln_plot.pdf", plot = vln.p, path = "./Plots")
+ggsave2(filename = "QC_scatter_plot.pdf", plot = scatter.p, path = "./Plots")
+
+print(vln.p)
+print(scatter.p)
+  
+
+```
+
+#### 8. Filtering ----------
+I am adjusting the %mito cutoff to 15% based on the publication "Systematic determination of the mitochondrial proportion in human and mice tissues for single-cell RNA-sequencing data quality control" (PMC8599307)
+```{r}
+# Original filtering step
+# so.all <- subset(so.all, subset = nFeature_RNA > 500 & 
+#                         percent.mt < 20 & nCount_RNA < 100000)
+
+
+so.all <- subset(so.all, subset = nFeature_RNA > 500 & 
+                        percent.mt < 15 & nCount_RNA < 100000)
+```
+
+#### 9. Split Seuratv5 object by donor ------------
+
+```{r}
+# Split Seurat object by donor_name
+so.all[["RNA"]] <- split(so.all[["RNA"]], f = so.all$donor_name)
+so.all
+```
+
+#### 10. Normalize data ----------
+
+```{r}
+# Normalize data
+so.all <- NormalizeData(so.all, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# Find variable features
+so.all <- FindVariableFeatures(so.all, selection.method = "vst", nfeatures = 5000)
+
+
+# Scale data
+all.genes <- rownames(so.all)
+
+# Original ScaleData. command
+so.all <- ScaleData(so.all)
+
+```
+
+
+#### 11. Perform Linear dimensionality reduction --------------
+
+```{r}
+so.all <- RunPCA(so.all, features = VariableFeatures(object = so.all))
+
+# visualize PCA results
+print(so.all[["pca"]], dims = 1:5, nfeatures = 5)
+DimHeatmap(so.all, dims = 1, cells = 500, balanced = TRUE)
+
+
+# determine dimensionality of the data
+ElbowPlot(so.all)
+```
+
+#### 12. Clustering ------------
+
+```{r}
+clustering_resolution = 0.5
+
+so.all <- FindNeighbors(so.all, dims = 1:15, reduction = "pca")
+so.all <- FindClusters(so.all, resolution = clustering_resolution, 
+                    cluster.name = "unintegrated_clusters")
+
+so.all <- RunUMAP(so.all, dims = 1:15, reduction = "pca", reduction.name = "umap.unintegrated")
+# visualize by batch and cell type annotation
+# cell type annotations were previously added by Azimuth
+DimPlot(so.all, 
+        reduction = "umap.unintegrated", 
+        group.by = c("donor_name","Final_clusters_paper"), 
+        label = TRUE)
+
+so.all <- RunTSNE(so.all, dims = 1:15, reduction = "pca", reduction.name = "tsne.unintegrated")
+# visualize by batch and cell type annotation
+# cell type annotations were previously added by Azimuth
+DimPlot(so.all, 
+        reduction = "tsne.unintegrated", 
+        group.by = c("donor_name","Final_clusters_paper"), 
+        label = TRUE)
+
+```
+
+#### 13. Integrate the three datasets (CCAIntegration): donor_1, donor_2, donor_3 ------------
+
+```{r}
+so.all <- IntegrateLayers(
+  object = so.all, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.cca",
+  verbose = FALSE
+)
+```
+
+
+#### 14. Clustering of integrated data ------------
+```{r}
+so.all <- FindNeighbors(so.all, reduction = "integrated.cca", dims = 1:15)
+so.all <- FindClusters(so.all, resolution = clustering_resolution, cluster.name = "cca_clusters")
+
+so.all <- RunUMAP(so.all, reduction = "integrated.cca", dims = 1:15, reduction.name = "umap.cca")
+p1 <- DimPlot(
+  so.all,
+  reduction = "umap.cca",
+  group.by = c("donor_name", "cca_clusters","Final_clusters_paper"),
+  combine = FALSE,
+  label = TRUE
+)
+
+ggsave2(filename = "./Plots/UMAP_CCA_integrated_by_donor_name.pdf", plot = p1[[1]])
+ggsave2(filename = "./Plots/UMAP_CCA_integrated_by_cca_cluster.pdf", plot = p1[[2]])
+ggsave2(filename = "./Plots/UMAP_CCA_integrated_by_paper_cluster.pdf", plot = p1[[3]])
+p1
+
+so.all <- RunTSNE(so.all, reduction = "integrated.cca", dims = 1:15, reduction.name = "tsne.cca")
+p2 <- DimPlot(
+  so.all,
+  reduction = "tsne.cca",
+  group.by = c("donor_name", "cca_clusters","Final_clusters_paper"),
+  combine = FALSE, 
+  label = TRUE
+)
+ggsave2(filename = "./Plots/tSNE_CCA_integrated_by_donor_name.pdf", plot = p2[[1]])
+ggsave2(filename = "./Plots/tSNE_CCA_integrated_by_cca_cluster.pdf", plot = p2[[2]])
+ggsave2(filename = "./Plots/tSNE_CCA_integrated_by_paper_cluster.pdf", plot = p2[[3]])
+p2
+```
+
+#### 15. Save so.all object ------------
+
+```{r}
+saveRDS(so.all, file = "so.all_integrated_seurat.rds")
+```
+
+#### 16. Check gene expression for PIWIL1 and PIWIL4 ------------
+
+```{r}
+piwil1.p <- VlnPlot(so.all,
+                    features = "PIWIL1", 
+                    group.by = "Final_clusters_paper",
+                    layer = "data") + 
+            NoLegend() + 
+            ggtitle("PIWIL1 - Clusters Cairns et al") +
+            xlab("Cluster number")
+
+ggsave2(filename = "Plots/PIWIL1_expression.pdf", plot = piwil1.p)
+piwil1.p
+
+piwil4.p <- VlnPlot(so.all,
+                    features = "PIWIL4", 
+                    group.by = "Final_clusters_paper",
+                    layer = "data") + 
+                    NoLegend() + 
+                    ggtitle("PIWIL4 - Clusters Cairns et al") + 
+                    xlab("Cluster number")
+
+ggsave2(filename = "Plots/PIWIL4_expression.pdf", plot = piwil4.p)
+piwil4.p
+```
+
+#### 17. Fetch expression data ------------
+
+```{r}
+piwi_norm_expr <- FetchData(so.all, layer = "data", vars = c("PIWIL1", "PIWIL4"))
+
+# Bin gene into centiles based on their expression
+piwi_norm_expr <- piwi_norm_expr  %>% mutate(centile_PIWIL1 = ntile(PIWIL1, 100)) %>% mutate(centile_PIWIL4 = ntile(PIWIL4, 100))
+
+# Extract cells with centile >= 95 for PIWIL1/4 genes
+centile_PIWIL1.95 <- subset(piwi_norm_expr, centile_PIWIL1 >= 95)
+centile_PIWIL4.95 <- subset(piwi_norm_expr, centile_PIWIL4 >= 95)
+
+# Add paper cluster info
+centile_PIWIL1.95 <- merge(centile_PIWIL1.95, subset(metadata.all, select = Final_clusters_paper), by='row.names')
+
+centile_PIWIL4.95 <- merge(centile_PIWIL4.95, subset(metadata.all, select = Final_clusters_paper), by='row.names')
+
+
+# Check distribution of centile >= 95 across clusters
+centile_PIWIL1.95.clusters <-  centile_PIWIL1.95 %>%
+                                group_by(Final_clusters_paper) %>% 
+                                count(Final_clusters_paper)
+
+centile_PIWIL4.95.clusters <-  centile_PIWIL4.95 %>%
+                                group_by(Final_clusters_paper) %>% 
+                                count(Final_clusters_paper)
+
+
+colnames(centile_PIWIL1.95.clusters) <- c('Cluster','Cell_count')
+colnames(centile_PIWIL4.95.clusters) <- c('Cluster','Cell_count')
+
+# Plot distribution of top 5% most expressing cells across clusters
+p1 <- ggplot(centile_PIWIL1.95.clusters, aes(x = Cluster, y = Cell_count)) + 
+      geom_col() + labs(title = "PIWIL1 top 5% expressing cells")
+      
+p1
+
+p4 <- ggplot(centile_PIWIL4.95.clusters, aes(x = Cluster, y = Cell_count)) + 
+      geom_col() + labs(title = "PIWIL4 top 5% expressing cells")
+      
+p4
+
+```
+
+#### 18. Prepare list of cells of interest ------------
+```{r}
+dir.create("./Tables", showWarnings = F)
+
+# Cells from any cluster that express piwil1/4 >= 95% centile
+write.table(subset(centile_PIWIL1.95, centile_PIWIL1 >= 95), file = "./Tables/piwil1_95_all_clusters.txt", sep = "\t", col.names = NA)
+
+write.table(subset(centile_PIWIL4.95, centile_PIWIL4 >= 95), file = "./Tables/piwil4_95_all_clusters.txt", sep = "\t", col.names = NA)
+
+# Cells from cluster D4 that express piwil1 >= 95% centile
+write.table(subset(centile_PIWIL1.95, centile_PIWIL1 >= 95 &
+                     Final_clusters_paper == 4), 
+            file = "./Tables/piwil1_95_cluster_D4.txt", 
+            sep = "\t", 
+            col.names = NA)
+
+# Cells from cluster A1 that express piwil4 >= 95% centile
+write.table(subset(centile_PIWIL4.95, centile_PIWIL4 >= 95 &
+                     Final_clusters_paper == 1), 
+            file = "./Tables/piwil4_95_cluster_A1.txt", 
+            sep = "\t", 
+            col.names = NA)
+
+# Cells from cluster D4 that express piwil1 >= 1% centile
+write.table(subset(centile_PIWIL1.95, centile_PIWIL1 >= 1 &
+                     Final_clusters_paper == 4), 
+            file = "./Tables/piwil1_any_expression_cluster_D4.txt", 
+            sep = "\t", 
+            col.names = NA)
+
+# Cells from cluster A1 that express piwil4 >= 1% centile
+write.table(subset(centile_PIWIL4.95, centile_PIWIL4 >= 1 &
+                     Final_clusters_paper == 1), 
+            file = "./Tables/piwil4_any_expression_cluster_A1.txt", 
+            sep = "\t", 
+            col.names = NA)
+
+# Save full centile_PIWIL1.95 and centile_PIWIL4.95 tables
+write.table(centile_PIWIL1.95, 
+            file = "./Tables/piwil1_any_expression_all_clusters.txt", 
+            sep = "\t", 
+            col.names = NA)
+
+write.table(centile_PIWIL4.95, 
+            file = "./Tables/piwil4_any_expression_all_clusters.txt", 
+            sep = "\t", 
+            col.names = NA)
+
+```
+
+
+
